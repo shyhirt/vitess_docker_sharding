@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS products ( product_id INT PRIMARY KEY,  name VARCHAR(255),  price DECIMAL(10,2) );
