@@ -1,0 +1,467 @@
+version: '3.8'
+
+services:
+  # Topology service
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: vt-etcd-1
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd1=http://0.0.0.0:2380
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # Control plane
+  vtctld:
+    image: vitess/vtctld:latest
+    user: "999:999"
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /vt/vtdataroot/backups
+        /vt/bin/vtctld \
+          --topo-implementation etcd2 \
+          --topo-global-server-address etcd:2379 \
+          --topo-global-root /vitess/global \
+          --service-map 'grpc-vtctl,grpc-vtctld' \
+          --backup-storage-implementation file \
+          --file-backup-storage-root /vt/vtdataroot/backups \
+          --port 15000 \
+          --grpc-port 15999 \
+          --logtostderr=true \
+          --alsologtostderr=false
+    ports:
+      - "15000:15000"
+      - "15999:15999"
+    volumes:
+      - vtdataroot:/vt/vtdataroot
+    depends_on:
+      etcd:
+        condition: service_healthy
+    security_opt:
+      - label:disable
+
+  # Инициализация топологии
+  vtctld_init:
+    image: vitess/vtctldclient:latest
+    user: "999:999"
+    depends_on:
+      - vtctld
+      - etcd
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+
+        echo "=== Waiting for vtctld ==="
+        for i in $(seq 1 30); do
+          if vtctldclient --server vtctld:15999 GetKeyspaces >/dev/null 2>&1; then
+            echo "vtctld is ready"
+            break
+          fi
+          echo "Waiting for vtctld... attempt $i/30"
+          sleep 2
+        done
+
+        echo "=== Ensure CellInfo zone1 ==="
+        vtctldclient --server vtctld:15999 AddCellInfo \
+          --root /vitess/zone1 \
+          --server-address etcd:2379 \
+          zone1 \
+          || vtctldclient --server vtctld:15999 UpdateCellInfo \
+               --root /vitess/zone1 \
+               --server-address etcd:2379 \
+               zone1
+
+        echo "=== Create keyspaces ==="
+        vtctldclient --server vtctld:15999 CreateKeyspace commerce || true
+        vtctldclient --server vtctld:15999 CreateKeyspace customer || true
+
+        echo "=== Create shards ==="
+        vtctldclient --server vtctld:15999 CreateShard commerce/0 || true
+        vtctldclient --server vtctld:15999 CreateShard customer/-80 || true
+        vtctldclient --server vtctld:15999 CreateShard customer/80- || true
+
+        echo "✓ Topo initialized."
+        
+        touch /tmp/topo-ready
+        tail -f /dev/null
+    security_opt:
+      - label:disable
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/topo-ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+      start_period: 20s
+
+  # ============= MySQL Servers =============
+
+  # Commerce keyspace - single shard
+  # Commerce keyspace - single shard
+  mysql_commerce:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: vt_commerce
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --binlog-format=ROW
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_commerce_data:/var/lib/mysql
+      - ./scripts/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Customer keyspace - shard -80
+  mysql_customer_shard0:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: vt_customer
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --binlog-format=ROW
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_customer_shard0_data:/var/lib/mysql
+      - ./scripts/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Customer keyspace - shard 80-
+  mysql_customer_shard1:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: vt_customer
+    command:
+      - --server-id=3
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --binlog-format=ROW
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_customer_shard1_data:/var/lib/mysql
+      - ./scripts/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============= VTTablets =============
+
+  vttablet_commerce:
+    image: vitess/vttablet:latest
+    user: "999:999"
+    command:
+      - sh
+      - -c
+      - |
+        /vt/bin/vttablet \
+          --topo-implementation=etcd2 \
+          --topo-global-server-address=etcd:2379 \
+          --topo-global-root=/vitess/global \
+          --tablet-path=zone1-0000000100 \
+          --init-keyspace=commerce \
+          --init-shard=0 \
+          --init-tablet-type=replica \
+          --service-map='grpc-tabletmanager,grpc-queryservice,grpc-updatestream' \
+          --port=15100 \
+          --grpc-port=16100 \
+          --db-host=mysql_commerce \
+          --db-port=3306 \
+          --db-app-user=root \
+          --db-app-password=root \
+          --db-app-use-ssl=false \
+          --db-dba-user=root \
+          --db-dba-password=root \
+          --db-dba-use-ssl=false \
+          --db-filtered-user=root \
+          --db-filtered-password=root \
+          --db-filtered-use-ssl=false \
+          --db-allprivs-user=root \
+          --db-allprivs-password=root \
+          --db-allprivs-use-ssl=false \
+          --db-repl-user=root \
+          --db-repl-password=root \
+          --db-repl-use-ssl=false \
+          --logtostderr=true \
+          --alsologtostderr=false
+    ports:
+      - "15100:15100"
+      - "16100:16100"
+    depends_on:
+      vtctld_init:
+        condition: service_healthy
+      mysql_commerce:
+        condition: service_healthy
+    security_opt:
+      - label:disable
+
+  vttablet_customer_shard0:
+    image: vitess/vttablet:latest
+    user: "999:999"
+    command:
+      - sh
+      - -c
+      - |
+        /vt/bin/vttablet \
+          --topo-implementation=etcd2 \
+          --topo-global-server-address=etcd:2379 \
+          --topo-global-root=/vitess/global \
+          --tablet-path=zone1-0000000200 \
+          --init-keyspace=customer \
+          --init-shard=-80 \
+          --init-tablet-type=replica \
+          --service-map='grpc-tabletmanager,grpc-queryservice,grpc-updatestream' \
+          --port=15200 \
+          --grpc-port=16200 \
+          --db-host=mysql_customer_shard0 \
+          --db-port=3306 \
+          --db-app-user=root \
+          --db-app-password=root \
+          --db-app-use-ssl=false \
+          --db-dba-user=root \
+          --db-dba-password=root \
+          --db-dba-use-ssl=false \
+          --db-filtered-user=root \
+          --db-filtered-password=root \
+          --db-filtered-use-ssl=false \
+          --db-allprivs-user=root \
+          --db-allprivs-password=root \
+          --db-allprivs-use-ssl=false \
+          --db-repl-user=root \
+          --db-repl-password=root \
+          --db-repl-use-ssl=false \
+          --logtostderr=true \
+          --alsologtostderr=false
+    ports:
+      - "15200:15200"
+      - "16200:16200"
+    depends_on:
+      vtctld_init:
+        condition: service_healthy
+      mysql_customer_shard0:
+        condition: service_healthy
+    security_opt:
+      - label:disable
+
+  vttablet_customer_shard1:
+    image: vitess/vttablet:latest
+    user: "999:999"
+    command:
+      - sh
+      - -c
+      - |
+        /vt/bin/vttablet \
+          --topo-implementation=etcd2 \
+          --topo-global-server-address=etcd:2379 \
+          --topo-global-root=/vitess/global \
+          --tablet-path=zone1-0000000202 \
+          --init-keyspace=customer \
+          --init-shard=80- \
+          --init-tablet-type=replica \
+          --service-map='grpc-tabletmanager,grpc-queryservice,grpc-updatestream' \
+          --port=15202 \
+          --grpc-port=16202 \
+          --db-host=mysql_customer_shard1 \
+          --db-port=3306 \
+          --db-app-user=root \
+          --db-app-password=root \
+          --db-app-use-ssl=false \
+          --db-dba-user=root \
+          --db-dba-password=root \
+          --db-dba-use-ssl=false \
+          --db-filtered-user=root \
+          --db-filtered-password=root \
+          --db-filtered-use-ssl=false \
+          --db-allprivs-user=root \
+          --db-allprivs-password=root \
+          --db-allprivs-use-ssl=false \
+          --db-repl-user=root \
+          --db-repl-password=root \
+          --db-repl-use-ssl=false \
+          --logtostderr=true \
+          --alsologtostderr=false
+    ports:
+      - "15202:15202"
+      - "16202:16202"
+    depends_on:
+      vtctld_init:
+        condition: service_healthy
+      mysql_customer_shard1:
+        condition: service_healthy
+    security_opt:
+      - label:disable
+
+  # VTOrc - automated failover
+  vtorc:
+    image: vitess/vtorc:latest
+    user: "999:999"
+    command:
+      - sh
+      - -c
+      - |
+        vtorc \
+          --topo_implementation etcd2 \
+          --topo_global_server_address etcd:2379 \
+          --topo_global_root /vitess/global \
+          --port 15010 \
+          --logtostderr=true \
+          --alsologtostderr
+    ports:
+      - "15010:15010"
+    depends_on:
+      vtctld_init:
+        condition: service_healthy
+    security_opt:
+      - label:disable
+
+  # VTGate - MySQL proxy
+  vtgate:
+    image: vitess/vtgate:latest
+    user: "999:999"
+    command:
+      - /vt/bin/vtgate
+      - --topo-implementation=etcd2
+      - --topo-global-server-address=etcd:2379
+      - --topo-global-root=/vitess/global
+      - --cell=zone1
+      - --cells-to-watch=zone1
+      - --tablet-types-to-wait=PRIMARY,REPLICA
+      - --gateway-initial-tablet-timeout=30s
+      - --port=15001
+      - --grpc-port=15991
+      - --mysql-server-port=15306
+      - --mysql-auth-server-impl=none
+      - --mysql-server-bind-address=0.0.0.0
+      - --logtostderr=true
+      - --alsologtostderr=false
+    ports:
+      - "15001:15001"
+      - "15991:15991"
+      - "15306:15306"
+    depends_on:
+      vtctld_init:
+        condition: service_healthy
+      vttablet_commerce:
+        condition: service_started
+      vttablet_customer_shard0:
+        condition: service_started
+      vttablet_customer_shard1:
+        condition: service_started
+    security_opt:
+      - label:disable
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /proc/1/status && echo 'ok' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+  schema_init:
+    image: vitess/vtctldclient:latest
+    user: "999:999"
+    depends_on:
+      vtgate:
+        condition: service_healthy
+    volumes:
+      - ./schema:/schema:ro
+      - ./scripts:/scripts:ro
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        
+        echo "=== Waiting for tablets ==="
+        sleep 20
+        
+        echo "=== Check tablets status ==="
+        vtctldclient --server vtctld:15999 GetTablets
+        
+        echo "=== Setting primary tablets ==="
+        vtctldclient --server vtctld:15999 PlannedReparentShard commerce/0 --new-primary zone1-0000000100
+        vtctldclient --server vtctld:15999 PlannedReparentShard customer/-80 --new-primary zone1-0000000200
+        vtctldclient --server vtctld:15999 PlannedReparentShard customer/80- --new-primary zone1-0000000202
+        
+        sleep 5
+        
+        echo "=== Rebuilding keyspace graph ==="
+        vtctldclient --server vtctld:15999 RebuildKeyspaceGraph commerce
+        vtctldclient --server vtctld:15999 RebuildKeyspaceGraph customer
+        
+        echo "=== Applying schemas ==="
+        vtctldclient --server vtctld:15999 ApplySchema \
+          --sql-file /schema/commerce_schema.sql commerce
+        
+        vtctldclient --server vtctld:15999 ApplySchema \
+          --sql-file /schema/customer_schema.sql customer
+        
+        echo "=== Applying VSchema ==="
+        vtctldclient --server vtctld:15999 ApplyVSchema \
+          --vschema-file /schema/commerce_vschema.json commerce
+        
+        vtctldclient --server vtctld:15999 ApplyVSchema \
+          --vschema-file /schema/customer_vschema.json customer
+        
+        echo "=== Rebuilding keyspace graph again ==="
+        vtctldclient --server vtctld:15999 RebuildKeyspaceGraph commerce
+        vtctldclient --server vtctld:15999 RebuildKeyspaceGraph customer
+        
+        echo "=== Loading sample data ==="
+        sleep 5
+        
+        echo "INSERT INTO products (product_id, name, price) VALUES (1, 'Laptop', 999.99), (2, 'Mouse', 29.99), (3, 'Keyboard', 79.99);" | \
+          mysql -h vtgate -P 15306 commerce
+        
+        echo "INSERT INTO customers (customer_id, name, email) VALUES (1, 'Alice', 'alice@example.com'), (2, 'Bob', 'bob@example.com'), (100, 'Charlie', 'charlie@example.com'), (200, 'Diana', 'diana@example.com');" | \
+          mysql -h vtgate -P 15306 customer
+        
+        echo "INSERT INTO orders (order_id, customer_id, product_id, quantity) VALUES (1, 1, 1, 1), (2, 2, 2, 2), (3, 100, 3, 1), (4, 200, 1, 1);" | \
+          mysql -h vtgate -P 15306 customer
+        
+        echo "✓ Complete!"
+        tail -f /dev/null
+    security_opt:
+      - label:disable
+volumes:
+  vtdataroot:
+  mysql_commerce_data:
+  mysql_customer_shard0_data:
+  mysql_customer_shard1_data:
